@@ -49,7 +49,8 @@ class PubHunt
 
 public:
 
-	PubHunt(const std::vector<std::vector<uint8_t>>& inputHashes, const std::string& outputFile, uint64_t startRange, uint64_t endRange);
+	PubHunt(const std::vector<std::vector<uint8_t>>& inputHashes, const std::string& outputFile, uint64_t startRange, uint64_t endRange,
+		const std::string& checkpointFile = "", uint32_t checkpointInterval = 300);
 
 	~PubHunt();
 
@@ -63,6 +64,14 @@ private:
 
 	bool hasStarted(TH_PARAM* p);
 	uint64_t getGPUCount();
+
+	// Checkpoint / crash-recovery support (random search: we persist the
+	// cumulative progress so a restart continues the statistics and the RNG
+	// coverage instead of starting the effort accounting from scratch).
+	uint64_t inputDigest();
+	bool SaveCheckpoint(uint64_t totalKeys, double elapsed);
+	bool LoadCheckpoint(uint64_t& totalKeys, double& elapsed, int& foundKeys);
+
 	uint64_t startRange;
 	uint64_t endRange;
 	std::string formatThousands(uint64_t x);
@@ -80,6 +89,11 @@ private:
 	int numHash160;
 
 	uint32_t maxFound;
+
+	std::string checkpointFile;
+	uint32_t checkpointInterval;   // seconds between checkpoints (0 = disabled)
+	uint64_t resumeCount;          // keys already scanned in a previous run
+	double resumeTime;             // seconds already elapsed in a previous run
 
 #ifdef WIN64
 	HANDLE ghMutex;

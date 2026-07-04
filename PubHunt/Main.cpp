@@ -35,6 +35,8 @@ void printUsage() {
     printf(" -o outputfile            : Output results to the specified file\n");
     printf(" -sr startRange           : Start of the key range to search (in hex)\n");
     printf(" -er endRange             : End of the key range to search (in hex)\n");
+    printf(" -cp checkpointFile       : Checkpoint file for crash recovery (default pubhunt.checkpoint)\n");
+    printf(" -cpt seconds             : Seconds between checkpoints, 0 disables (default 300)\n");
     printf(" -l                       : List cuda enabled devices\n");
     printf(" -check                   : Check Int calculations\n");
     printf(" inputFile                : List of the hash160, one per line in hex format (text mode)\n\n");
@@ -85,6 +87,8 @@ int main(int argc, const char* argv[])
     vector<int> gridSize;
 
     string outputFile = "Found.txt";
+    string checkpointFile = "pubhunt.checkpoint";
+    uint32_t checkpointInterval = 300;
 
     std::vector<std::vector<uint8_t>> inputHashes;
 
@@ -141,6 +145,16 @@ int main(int argc, const char* argv[])
             outputFile = string(argv[a]);
             a++;
         }
+        else if (strcmp(argv[a], "-cp") == 0) {
+            a++;
+            checkpointFile = string(argv[a]);
+            a++;
+        }
+        else if (strcmp(argv[a], "-cpt") == 0) {
+            a++;
+            checkpointInterval = (uint32_t)strtoul(argv[a], nullptr, 10);
+            a++;
+        }
         else if (strcmp(argv[a], "-h") == 0) {
             printUsage();
         }
@@ -194,10 +208,14 @@ int main(int argc, const char* argv[])
     printf("NUM HASH160  : %" PRIu64 "\n", static_cast<uint64_t>(inputHashes.size()));
     printf("OUTPUT FILE  : %s\n", outputFile.c_str());
 	printf("KEY RANGE    : 0x%016llx - 0x%016llx\n", startRange, endRange);
+    if (checkpointInterval > 0)
+        printf("CHECKPOINT   : %s (every %u sec)\n", checkpointFile.c_str(), checkpointInterval);
+    else
+        printf("CHECKPOINT   : disabled\n");
 
 #ifdef WIN64
     if (SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        PubHunt* v = new PubHunt(inputHashes, outputFile, startRange, endRange);
+        PubHunt* v = new PubHunt(inputHashes, outputFile, startRange, endRange, checkpointFile, checkpointInterval);
 
         v->Search(gpuId, gridSize, should_exit);
         delete v;
@@ -211,7 +229,7 @@ int main(int argc, const char* argv[])
 #else
     signal(SIGINT, CtrlHandler);
 
-    PubHunt* v = new PubHunt(inputHashes, outputFile, startRange, endRange);
+    PubHunt* v = new PubHunt(inputHashes, outputFile, startRange, endRange, checkpointFile, checkpointInterval);
 
     v->Search(gpuId, gridSize, should_exit);
     delete v;

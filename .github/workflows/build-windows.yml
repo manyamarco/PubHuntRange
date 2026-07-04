@@ -1,0 +1,97 @@
+name: Build Windows (CUDA)
+
+# Builds a universal (multi-architecture) CUDA binary of PubHunt for
+# Windows 10/11 x64. The fat binary includes SASS for Maxwell..Hopper plus
+# PTX for forward JIT, so it runs on a GeForce RTX 3080 (Ampere, sm_86) as
+# well as most other modern NVIDIA GPUs.
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      CUDA_VERSION: '12.6.3'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }}
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: 'network'
+          use-github-cache: false
+          use-local-cache: false
+
+      - name: Report toolchain
+        shell: pwsh
+        run: |
+          nvcc --version
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # The network installer does not always drop the CUDA MSBuild
+      # integration into the VS toolset, so copy it in explicitly. This makes
+      # the "CUDA x.y.props/targets" imports in the .vcxproj resolve.
+      - name: Integrate CUDA with MSBuild
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:CUDA_PATH 'extras\visual_studio_integration\MSBuildExtensions'
+          if (-not (Test-Path $src)) { throw "CUDA VS integration not found at $src" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath  = & $vswhere -latest -products * -property installationPath
+          $dst = Join-Path $vsPath 'MSBuild\Microsoft\VC\v170\BuildCustomizations'
+          Write-Host "Copying CUDA integration -> $dst"
+          Copy-Item "$src\*" $dst -Force -Verbose
+
+      # Rewrite the CUDA version referenced by the project so the build works
+      # regardless of the exact CUDA minor version that got installed.
+      - name: Align project CUDA version
+        shell: pwsh
+        run: |
+          $ver = (Split-Path $env:CUDA_PATH -Leaf) -replace '^v',''   # e.g. 12.6
+          $mm  = (($ver -split '\.')[0..1]) -join '.'
+          $proj = 'PubHunt/PubHunt.vcxproj'
+          (Get-Content $proj) -replace 'CUDA \d+\.\d+\.(props|targets)', "CUDA $mm.`$1" | Set-Content $proj
+          Get-Content $proj | Select-String 'CUDA .*\.(props|targets)'
+
+      - name: Build (Release x64)
+        shell: pwsh
+        run: |
+          msbuild PubHunt.sln /p:Configuration=Release /p:Platform=x64 /m /nologo
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = Get-ChildItem -Recurse -Filter PubHunt.exe |
+                 Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+          if (-not $exe) { $exe = Get-ChildItem -Recurse -Filter PubHunt.exe | Select-Object -First 1 }
+          if (-not $exe) { throw "PubHunt.exe not found" }
+          Write-Host "Built: $($exe.FullName)"
+          Copy-Item $exe.FullName dist/
+          Copy-Item PubHunt/hash160.txt dist/ -ErrorAction SilentlyContinue
+          Copy-Item README.md dist/ -ErrorAction SilentlyContinue
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PubHunt-win64-cuda${{ env.CUDA_VERSION }}
+          path: dist/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

@@ -30,10 +30,30 @@ PubHunt [-check] [-h] [-v]
  -o outputfile            : Output results to the specified file
  -sr startRange           : Start of the key range to search
  -er endRange             : End of the key range to search
+ -cp checkpointFile       : Checkpoint file for crash recovery (default pubhunt.checkpoint)
+ -cpt seconds             : Seconds between checkpoints, 0 disables (default 300)
  -l                       : List cuda enabled devices
  -check                   : Check Int calculations
  inputFile                : List of the hash160, one per line in hex format (text mode)
 ```
+
+### Checkpoints & crash recovery
+
+PubHunt performs a **random** (Monte-Carlo) search: cuRAND draws random keys and
+maps them into `[startRange, endRange]`, so there is no sequential position to
+resume from. Instead the program persists its cumulative progress to a
+checkpoint file every 5 minutes (configurable via `-cpt`) and on a clean exit
+(Ctrl-C). If the program is killed unexpectedly, the next launch with the same
+range and input file automatically:
+
+- restores the accumulated key count, elapsed time and found counter, and
+- advances the quasi-random sequence past the keys already scanned, so coverage
+  continues instead of restarting the same region.
+
+Found keys are always appended to the output file the instant they are found, so
+they are never lost regardless of checkpointing. The checkpoint is written
+atomically (temp file + rename) and is ignored if its stored range / hash160 set
+does not match the current run. Use `-cpt 0` to disable checkpointing.
 
 For example:
 ```
@@ -53,9 +73,32 @@ GPU          : GPU #0 NVIDIA GeForce RTX 4070 (46x0 cores) Grid(8192x1024)
 ```
 
 ## Building
-##### Windows
-- Microsoft Visual Studio Community 2019 
-- CUDA version 10.0
+
+##### GitHub Actions (Windows 10/11 x64, universal CUDA build)
+
+A ready-to-use workflow is included at
+[`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml).
+It installs the CUDA Toolkit, builds a **universal fat binary** (SASS for
+Maxwell → Hopper plus PTX for forward JIT) and uploads `PubHunt.exe` as a build
+artifact. The binary runs on a **GeForce RTX 3080 (Ampere, compute capability
+8.6)** and most other modern NVIDIA GPUs.
+
+To use it:
+1. Push this fork to GitHub (the workflow runs on every push, or run it manually
+   from the **Actions** tab → *Build Windows (CUDA)* → *Run workflow*).
+2. Download the `PubHunt-win64-cuda...` artifact from the finished run.
+3. Pushing a tag like `v1.0` also publishes the binary as a GitHub Release.
+
+The set of GPU architectures is defined by `CodeGeneration` in
+[`PubHunt/PubHunt.vcxproj`](PubHunt/PubHunt.vcxproj); add or remove `sm_XX`
+entries there to trim the binary. To build for **only** the RTX 3080 (smaller,
+faster to compile) reduce it to `compute_86,sm_86;compute_86,compute_86`.
+
+##### Windows (local)
+- Microsoft Visual Studio Community 2022 (toolset v143)
+- CUDA Toolkit 11.1+ (12.x recommended for RTX 3080 / sm_86)
+- Open `PubHunt.sln`, select `Release | x64`, and build.
+
 ##### Linux
  - Edit the makefile and set up the appropriate CUDA SDK and compiler paths for nvcc. Or pass them as variables to `make` command.
 
@@ -64,8 +107,9 @@ GPU          : GPU #0 NVIDIA GeForce RTX 4070 (46x0 cores) Grid(8192x1024)
     CXXCUDA    = /usr/bin/g++
     ```
  - To build with CUDA: pass CCAP value according to your GPU compute capability
+   (RTX 3080 = `86`)
     ```sh
-    $ make CCAP=89 all
+    $ make CCAP=86 all
     ```
 
 ## License

@@ -31,13 +31,19 @@ using namespace std;
 
 // ----------------------------------------------------------------------------
 
-PubHunt::PubHunt(const std::vector<std::vector<uint8_t>>& inputHashes, const std::string& outputFile, uint64_t startRange, uint64_t endRange)
+PubHunt::PubHunt(const std::vector<std::vector<uint8_t>>& inputHashes, const std::string& outputFile, uint64_t startRange, uint64_t endRange,
+    const std::string& checkpointFile, uint32_t checkpointInterval)
 {
     this->outputFile = outputFile;
     this->nbGPUThread = 0;
     this->maxFound = 65536;
     this->startRange = startRange;
     this->endRange = endRange;
+
+    this->checkpointFile = checkpointFile;
+    this->checkpointInterval = checkpointInterval;
+    this->resumeCount = 0;
+    this->resumeTime = 0.0;
 
 	this->numHash160 = inputHashes.size();
 
@@ -151,7 +157,7 @@ void PubHunt::FindKeyGPU(TH_PARAM * ph)
 	// Global init
 	int thId = ph->threadId;
 
-	GPUEngine* g = new GPUEngine(ph->gridSizeX, ph->gridSizeY, ph->gpuId, maxFound, hash160, numHash160, startRange, endRange);
+	GPUEngine* g = new GPUEngine(ph->gridSizeX, ph->gridSizeY, ph->gpuId, maxFound, hash160, numHash160, startRange, endRange, resumeCount);
 
 	int nbThread = g->GetNbThread();
 
@@ -230,6 +236,101 @@ uint64_t PubHunt::getGPUCount()
 
 // ----------------------------------------------------------------------------
 
+// 64-bit FNV-1a digest of the input hash160 set. Used to make sure a checkpoint
+// is only resumed when it belongs to the same search (same target hashes).
+uint64_t PubHunt::inputDigest()
+{
+	uint64_t h = 1469598103934665603ULL; // FNV offset basis
+	const uint8_t* p = (const uint8_t*)hash160;
+	size_t n = (size_t)numHash160 * 20;
+	for (size_t i = 0; i < n; i++) {
+		h ^= (uint64_t)p[i];
+		h *= 1099511628211ULL; // FNV prime
+	}
+	return h;
+}
+
+// ----------------------------------------------------------------------------
+
+// Persist cumulative progress atomically (write to a temp file then rename)
+// so an interrupted write can never corrupt an existing checkpoint.
+bool PubHunt::SaveCheckpoint(uint64_t totalKeys, double elapsed)
+{
+	if (checkpointFile.empty())
+		return false;
+
+	std::string tmp = checkpointFile + ".tmp";
+	FILE* f = fopen(tmp.c_str(), "w");
+	if (f == NULL)
+		return false;
+
+	fprintf(f, "PUBHUNT_CHECKPOINT_V1\n");
+	fprintf(f, "startRange=%016llx\n", (unsigned long long)startRange);
+	fprintf(f, "endRange=%016llx\n", (unsigned long long)endRange);
+	fprintf(f, "numHash160=%d\n", numHash160);
+	fprintf(f, "inputDigest=%016llx\n", (unsigned long long)inputDigest());
+	fprintf(f, "totalKeys=%llu\n", (unsigned long long)totalKeys);
+	fprintf(f, "elapsedSec=%.3f\n", elapsed);
+	fprintf(f, "foundKeys=%d\n", nbFoundKey);
+	fflush(f);
+	fclose(f);
+
+	// Atomic replace. std::rename fails on Windows if the target exists, so
+	// remove it first; the .tmp file still holds a valid checkpoint meanwhile.
+	remove(checkpointFile.c_str());
+	if (rename(tmp.c_str(), checkpointFile.c_str()) != 0) {
+		remove(tmp.c_str());
+		return false;
+	}
+	return true;
+}
+
+// ----------------------------------------------------------------------------
+
+// Load a checkpoint, but only accept it if it matches the current search
+// parameters. Returns false (fresh start) on any mismatch or parse error.
+bool PubHunt::LoadCheckpoint(uint64_t& totalKeys, double& elapsed, int& foundKeys)
+{
+	if (checkpointFile.empty())
+		return false;
+
+	FILE* f = fopen(checkpointFile.c_str(), "r");
+	if (f == NULL)
+		return false;
+
+	char magic[64] = { 0 };
+	uint64_t cpStart = 0, cpEnd = 0, cpDigest = 0, cpKeys = 0;
+	int cpNum = -1, cpFound = 0;
+	double cpElapsed = 0.0;
+
+	bool ok = (fscanf(f, "%63s\n", magic) == 1) && (strcmp(magic, "PUBHUNT_CHECKPOINT_V1") == 0);
+	ok = ok && (fscanf(f, "startRange=%llx\n", (unsigned long long*)&cpStart) == 1);
+	ok = ok && (fscanf(f, "endRange=%llx\n", (unsigned long long*)&cpEnd) == 1);
+	ok = ok && (fscanf(f, "numHash160=%d\n", &cpNum) == 1);
+	ok = ok && (fscanf(f, "inputDigest=%llx\n", (unsigned long long*)&cpDigest) == 1);
+	ok = ok && (fscanf(f, "totalKeys=%llu\n", (unsigned long long*)&cpKeys) == 1);
+	ok = ok && (fscanf(f, "elapsedSec=%lf\n", &cpElapsed) == 1);
+	ok = ok && (fscanf(f, "foundKeys=%d\n", &cpFound) == 1);
+	fclose(f);
+
+	if (!ok) {
+		printf("Checkpoint: ignoring '%s' (unreadable or wrong format)\n", checkpointFile.c_str());
+		return false;
+	}
+
+	if (cpStart != startRange || cpEnd != endRange || cpNum != numHash160 || cpDigest != inputDigest()) {
+		printf("Checkpoint: ignoring '%s' (parameters differ from current search)\n", checkpointFile.c_str());
+		return false;
+	}
+
+	totalKeys = cpKeys;
+	elapsed = cpElapsed;
+	foundKeys = cpFound;
+	return true;
+}
+
+// ----------------------------------------------------------------------------
+
 void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& should_exit)
 {
 
@@ -241,6 +342,22 @@ void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& sh
 	nbFoundKey = 0;
 
 	memset(counters, 0, sizeof(counters));
+
+	// Resume from a previous run if a matching checkpoint exists. This must run
+	// before the GPU threads start so resumeCount is used as the RNG offset.
+	resumeCount = 0;
+	resumeTime = 0.0;
+	{
+		uint64_t cpKeys = 0; double cpElapsed = 0.0; int cpFound = 0;
+		if (LoadCheckpoint(cpKeys, cpElapsed, cpFound)) {
+			resumeCount = cpKeys;
+			resumeTime = cpElapsed;
+			nbFoundKey = cpFound;
+			char tstr[256] = { 0 };
+			printf("Checkpoint: resuming from '%s' [T: %s scanned, %d found]\n",
+				checkpointFile.c_str(), toTimeStr((int)resumeTime, tstr), nbFoundKey);
+		}
+	}
 
 	TH_PARAM* params = (TH_PARAM*)malloc((nbGPUThread) * sizeof(TH_PARAM));
 	memset(params, 0, (nbGPUThread) * sizeof(TH_PARAM));
@@ -267,7 +384,7 @@ void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& sh
 	setvbuf(stdout, NULL, _IONBF, 0);
 #endif
 
-	uint64_t lastCount = 0;
+	uint64_t lastCount = resumeCount;
 	uint64_t gpuCount = 0;
 	uint64_t lastGPUCount = 0;
 
@@ -297,6 +414,8 @@ void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& sh
 
 	Int ICount;
 
+	double lastCheckpoint = t0;
+
 	while (isAlive(params)) {
 
 		int delay = 2000;
@@ -306,7 +425,8 @@ void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& sh
 		}
 
 		gpuCount = getGPUCount();
-		uint64_t count = gpuCount;
+		// count = cumulative keys including any resumed from a checkpoint.
+		uint64_t count = gpuCount + resumeCount;
 		ICount.SetInt64(count);
 		int completedBits = ICount.GetBitLength();
 
@@ -328,11 +448,18 @@ void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& sh
 		if (isAlive(params)) {
 			memset(timeStr, '\0', 256);
 			printf("\r[%s] [GPU: %.2f MK/s] [T: %s (%d bit)] [F: %d]  ",
-				toTimeStr(t1, timeStr),
+				toTimeStr((int)(t1 + resumeTime), timeStr),
 				avgGpuKeyRate / 1000000.0,
 				formatThousands(count).c_str(),
 				completedBits,
 				nbFoundKey);
+		}
+
+		// Periodic checkpoint so an unexpected termination loses at most
+		// `checkpointInterval` seconds of accounted progress.
+		if (checkpointInterval > 0 && (t1 - lastCheckpoint) >= (double)checkpointInterval) {
+			SaveCheckpoint(count, t1 + resumeTime);
+			lastCheckpoint = t1;
 		}
 
 		lastCount = count;
@@ -340,6 +467,12 @@ void PubHunt::Search(std::vector<int> gpuId, std::vector<int> gridSize, bool& sh
 		t0 = t1;
 		if (should_exit)
 			endOfSearch = true;
+	}
+
+	// Final checkpoint on a clean exit (Ctrl-C or a thread stopping) so the
+	// next launch resumes from the latest progress.
+	if (checkpointInterval > 0) {
+		SaveCheckpoint(getGPUCount() + resumeCount, Timer::get_tick() + resumeTime);
 	}
 
 	free(params);

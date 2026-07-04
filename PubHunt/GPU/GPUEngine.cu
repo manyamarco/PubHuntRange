@@ -141,6 +141,9 @@ int _ConvertSMVer2Cores(int major, int minor)
 		{0x75,  64},
 		{0x80,  64},
 		{0x86, 128},
+		{0x87, 128},
+		{0x89, 128},
+		{0x90, 128},
 		{-1, -1}
 	};
 
@@ -160,7 +163,7 @@ int _ConvertSMVer2Cores(int major, int minor)
 
 // ----------------------------------------------------------------------------
 
-GPUEngine::GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_t maxFound, const uint32_t* hash160, int numHash160, uint64_t startRange, uint64_t endRange)
+GPUEngine::GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_t maxFound, const uint32_t* hash160, int numHash160, uint64_t startRange, uint64_t endRange, uint64_t rndOffset)
 {
 
 	// Initialise CUDA
@@ -226,7 +229,10 @@ GPUEngine::GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_
 	// cuda-rand
 	CudaSafeCall(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 	CudaRandSafeCall(curandCreateGenerator(&prngGPU, CURAND_RNG_QUASI_SCRAMBLED_SOBOL64));
-	CudaRandSafeCall(curandSetGeneratorOffset(prngGPU, std::time(0)));
+	// Advance the quasi-random sequence past the keys already scanned in a
+	// previous run (rndOffset) so a resumed search keeps exploring fresh
+	// keys instead of repeating the same Sobol region.
+	CudaRandSafeCall(curandSetGeneratorOffset(prngGPU, rndOffset + (uint64_t)std::time(0)));
 	CudaRandSafeCall(curandSetStream(prngGPU, stream));
 
 	Randomize();

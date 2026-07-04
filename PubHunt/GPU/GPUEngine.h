@@ -38,7 +38,8 @@ class GPUEngine
 public:
 
     GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_t maxFound,
-              const uint32_t* hash160, int numHash160, uint64_t startRange, uint64_t endRange);
+              const uint32_t* hash160, int numHash160, uint64_t startRange, uint64_t endRange,
+              uint64_t rndOffset = 0);
 
     ~GPUEngine();
 
