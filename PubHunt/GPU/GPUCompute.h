@@ -40,8 +40,9 @@ __device__ void ComputeHash(uint64_t* keys, uint32_t* hash160, int numHash160, u
 	uint32_t hE[5];
 	uint32_t hO[5];
 
-	_GetHash160Comp(keys, 0, (uint8_t*)hE);
-	_GetHash160Comp(keys, 1, (uint8_t*)hO);
+	// Compute the even and odd hash160 together: the two compressed public
+	// keys differ only in the leading byte, so the message setup is shared.
+	_GetHash160CompSym(keys, (uint8_t*)hE, (uint8_t*)hO);
 	
 	//for (int32_t i = 0; i < 32; i++) {
 	//	printf("%02x", ((uint8_t*)keys)[i]);
