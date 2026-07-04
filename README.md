@@ -72,6 +72,20 @@ GPU          : GPU #0 NVIDIA GeForce RTX 4070 (46x0 cores) Grid(8192x1024)
 [00:00:14] [GPU: 2681.56 MH/s] [T: 37,547,409,408 (36 bit)] [F: 0]
 ```
 
+### Performance notes
+
+- The GPU kernel is pure hashing (SHA-256 + RIPEMD-160), so throughput is
+  bound by integer/hash rate. The status line reports **hash operations** (two
+  per candidate X, for the even and odd public keys), i.e. the distinct-key rate
+  is about half the printed `MK/s`.
+- The RNG generation is double-buffered so cuRAND overlaps with the compute
+  kernel, and the oversized per-thread stack reservation inherited from
+  VanitySearch has been removed.
+- If throughput looks low, first check the GPU is not power/thermal throttling
+  (`nvidia-smi -l 1`: clocks, power, temperature), then sweep the grid size —
+  e.g. `-gx 8704,128`, `-gx 4352,256`, or omit `-gx` for the default. Very large
+  thread-per-group values (like `1024`) often lower occupancy.
+
 ## Building
 
 ##### GitHub Actions (Windows 10/11 x64, universal CUDA build)

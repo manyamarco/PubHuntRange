@@ -206,11 +206,15 @@ GPUEngine::GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_
 	// Prefer L1 (We do not use __shared__ at all)
 	CudaSafeCall(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
 
-	size_t stackSize = 49152;
-	CudaSafeCall(cudaDeviceSetLimit(cudaLimitStackSize, stackSize));
+	// Note: the large per-thread stack limit used by VanitySearch is not
+	// needed here. This kernel is straight-line hashing with no deep call
+	// chain or recursion, so we leave the default (small) stack, which avoids
+	// reserving gigabytes of local-memory backing store.
 
-	// Allocate memory
-	CudaSafeCall(cudaMalloc((void**)&inputKey, nbThread * 4 * sizeof(uint64_t)));
+	// Allocate memory (two key buffers for RNG / compute overlap)
+	CudaSafeCall(cudaMalloc((void**)&inputKey[0], nbThread * 4 * sizeof(uint64_t)));
+	CudaSafeCall(cudaMalloc((void**)&inputKey[1], nbThread * 4 * sizeof(uint64_t)));
+	keyBuf = 0;
 
 	CudaSafeCall(cudaMalloc((void**)&outputBuffer, outputSize));
 	CudaSafeCall(cudaHostAlloc(&outputBufferPinned, outputSize, cudaHostAllocWriteCombined | cudaHostAllocMapped));
@@ -226,16 +230,20 @@ GPUEngine::GPUEngine(int nbThreadGroup, int nbThreadPerGroup, int gpuId, uint32_
 	CudaSafeCall(cudaFreeHost(inputHashPinned));
 	inputHashPinned = NULL;
 
-	// cuda-rand
-	CudaSafeCall(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+	// cuda-rand. Two independent non-blocking streams let the RNG stream and
+	// the compute stream run concurrently.
+	CudaSafeCall(cudaStreamCreateWithFlags(&rngStream, cudaStreamNonBlocking));
+	CudaSafeCall(cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking));
 	CudaRandSafeCall(curandCreateGenerator(&prngGPU, CURAND_RNG_QUASI_SCRAMBLED_SOBOL64));
 	// Advance the quasi-random sequence past the keys already scanned in a
 	// previous run (rndOffset) so a resumed search keeps exploring fresh
 	// keys instead of repeating the same Sobol region.
 	CudaRandSafeCall(curandSetGeneratorOffset(prngGPU, rndOffset + (uint64_t)std::time(0)));
-	CudaRandSafeCall(curandSetStream(prngGPU, stream));
+	CudaRandSafeCall(curandSetStream(prngGPU, rngStream));
 
-	Randomize();
+	// Prime the first key buffer so the very first Step has data ready.
+	Randomize(keyBuf);
+	CudaSafeCall(cudaStreamSynchronize(rngStream));
 
 	CudaSafeCall(cudaGetLastError());
 
@@ -288,14 +296,16 @@ void GPUEngine::PrintCudaInfo()
 
 GPUEngine::~GPUEngine()
 {
-	CudaSafeCall(cudaFree(inputKey));
+	CudaSafeCall(cudaFree(inputKey[0]));
+	CudaSafeCall(cudaFree(inputKey[1]));
 	CudaSafeCall(cudaFree(inputHash));
 
 	CudaSafeCall(cudaFreeHost(outputBufferPinned));
 	CudaSafeCall(cudaFree(outputBuffer));
 
 	CudaRandSafeCall(curandDestroyGenerator(prngGPU));
-	CudaSafeCall(cudaStreamDestroy(stream));
+	CudaSafeCall(cudaStreamDestroy(rngStream));
+	CudaSafeCall(cudaStreamDestroy(computeStream));
 
 }
 
@@ -311,12 +321,12 @@ int GPUEngine::GetNbThread()
 bool GPUEngine::CallKernel()
 {
 
-	// Reset nbFound
-	CudaSafeCall(cudaMemset(outputBuffer, 0, 4));
+	// Reset nbFound and launch the kernel on the compute stream, consuming the
+	// currently-ready key buffer.
+	CudaSafeCall(cudaMemsetAsync(outputBuffer, 0, 4, computeStream));
 
-	// Call the kernel (Perform STEP_SIZE keys per thread) 
-	compute_hash<<<nbThread / nbThreadPerGroup, nbThreadPerGroup>>>
-        (inputKey, inputHash, numHash160, maxFound, outputBuffer, startRange, endRange);
+	compute_hash<<<nbThread / nbThreadPerGroup, nbThreadPerGroup, 0, computeStream>>>
+        (inputKey[keyBuf], inputHash, numHash160, maxFound, outputBuffer, startRange, endRange);
 
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) {
@@ -334,28 +344,27 @@ bool GPUEngine::Step(std::vector<ITEM>& dataFound, bool spinWait)
 	dataFound.clear();
 	bool ret = true;
 
-	ret = Randomize();
-
+	// Launch the kernel on the current key buffer...
 	ret = CallKernel();
 
-	// Get the result
+	// ...and, concurrently, generate the keys for the next Step into the other
+	// buffer on the RNG stream. This overlaps cuRAND with the compute kernel.
+	Randomize(keyBuf ^ 1);
+
+	// Wait for the kernel (and its outputBuffer reset) to complete.
 	if (spinWait) {
-		CudaSafeCall(cudaMemcpy(outputBufferPinned, outputBuffer, outputSize, cudaMemcpyDeviceToHost));
+		CudaSafeCall(cudaStreamSynchronize(computeStream));
 	}
 	else {
-		// Use cudaMemcpyAsync to avoid default spin wait of cudaMemcpy wich takes 100% CPU
-		cudaEvent_t evt;
-		CudaSafeCall(cudaEventCreate(&evt));
-		CudaSafeCall(cudaMemcpyAsync(outputBufferPinned, outputBuffer, 4, cudaMemcpyDeviceToHost, 0));
-		CudaSafeCall(cudaEventRecord(evt, 0));
-		while (cudaEventQuery(evt) == cudaErrorNotReady) {
-			// Sleep 1 ms to free the CPU
+		// Poll to keep the CPU mostly idle while the kernel runs.
+		while (cudaStreamQuery(computeStream) == cudaErrorNotReady) {
 			Timer::SleepMillis(1);
 		}
-		CudaSafeCall(cudaEventDestroy(evt));
+		CudaSafeCall(cudaStreamQuery(computeStream));
 	}
 
 	// Look for found
+	CudaSafeCall(cudaMemcpy(outputBufferPinned, outputBuffer, 4, cudaMemcpyDeviceToHost));
 	uint32_t nbFound = outputBufferPinned[0];
 	if (nbFound > maxFound) {
 		nbFound = maxFound;
@@ -373,15 +382,19 @@ bool GPUEngine::Step(std::vector<ITEM>& dataFound, bool spinWait)
 		dataFound.push_back(it);
 	}
 
+	// Make sure the next buffer's keys are fully generated, then swap to it.
+	CudaSafeCall(cudaStreamSynchronize(rngStream));
+	keyBuf ^= 1;
+
 	return ret;
 }
 
 // ----------------------------------------------------------------------------
 
-bool GPUEngine::Randomize()
+bool GPUEngine::Randomize(int buf)
 {
-	CudaRandSafeCall(curandGenerateLongLong(prngGPU, (unsigned long long*)inputKey, nbThread * 4));
-	CudaSafeCall(cudaStreamSynchronize(stream));
+	// Async on rngStream; the caller synchronizes rngStream before using buf.
+	CudaRandSafeCall(curandGenerateLongLong(prngGPU, (unsigned long long*)inputKey[buf], nbThread * 4));
 
 	return true;
 }

@@ -54,7 +54,7 @@ public:
 
 private:
 
-    bool Randomize();
+    bool Randomize(int buf);
     bool CallKernel();
 
     int nbThread;
@@ -64,7 +64,10 @@ private:
     uint32_t* inputHash;
     uint32_t* inputHashPinned;
 
-    uint64_t* inputKey;
+    // Double-buffered random keys: while the kernel consumes one buffer the
+    // RNG fills the other, so cuRAND generation overlaps with compute.
+    uint64_t* inputKey[2];
+    int keyBuf;
 
     uint32_t* outputBuffer;
     uint32_t* outputBufferPinned;
@@ -77,7 +80,8 @@ private:
 
     // cuda-random
     curandGenerator_t prngGPU;
-    cudaStream_t stream;
+    cudaStream_t rngStream;      // cuRAND generation
+    cudaStream_t computeStream;  // kernel + result copies
 
     uint64_t startRange;
     uint64_t endRange;
