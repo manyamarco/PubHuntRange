@@ -351,17 +351,11 @@ bool GPUEngine::Step(std::vector<ITEM>& dataFound, bool spinWait)
 	// buffer on the RNG stream. This overlaps cuRAND with the compute kernel.
 	Randomize(keyBuf ^ 1);
 
-	// Wait for the kernel (and its outputBuffer reset) to complete.
-	if (spinWait) {
-		CudaSafeCall(cudaStreamSynchronize(computeStream));
-	}
-	else {
-		// Poll to keep the CPU mostly idle while the kernel runs.
-		while (cudaStreamQuery(computeStream) == cudaErrorNotReady) {
-			Timer::SleepMillis(1);
-		}
-		CudaSafeCall(cudaStreamQuery(computeStream));
-	}
+	// Wait for the kernel (and its outputBuffer reset) to complete. We use a
+	// blocking synchronize instead of a sleep-poll: on WDDM the 1 ms sleep left
+	// the GPU idle between launches (it dropped to a low-power P-state), which
+	// hurt throughput far more than the saved CPU. This spins one host core.
+	CudaSafeCall(cudaStreamSynchronize(computeStream));
 
 	// Look for found
 	CudaSafeCall(cudaMemcpy(outputBufferPinned, outputBuffer, 4, cudaMemcpyDeviceToHost));
